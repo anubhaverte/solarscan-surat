@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Per-Tile Rooftop Calibrator</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  body{margin:0;font-family:Arial,sans-serif}
+  #map{height:100vh;width:100vw}
+  #panel{position:absolute;top:10px;right:10px;background:#fff;padding:14px;border-radius:8px;
+         box-shadow:0 4px 12px rgba(0,0,0,.3);z-index:1000;width:290px;font-size:13px}
+  h3{margin:0 0 8px}
+  #status{font-weight:bold;margin-bottom:8px;color:#888}
+  select,button{width:100%;padding:6px;margin:4px 0;font-size:13px}
+  .row{margin:6px 0}
+  .val{font-family:monospace;color:#d32f2f;font-weight:bold}
+  .legend{font-size:11px;color:#555;margin-top:6px;line-height:1.5}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <h3>🎯 Per-Tile Calibrator</h3>
+  <div id="status">⏳ Loading…</div>
+  <label>Tile to adjust:</label>
+  <select id="tileSel"></select>
+  <div class="row">Lat shift: <span class="val" id="vDLat">0</span>
+    <input type="range" id="sDLat" min="-0.002" max="0.002" step="0.00001" style="width:100%"></div>
+  <div class="row">Lon shift: <span class="val" id="vDLon">0</span>
+    <input type="range" id="sDLon" min="-0.002" max="0.002" step="0.00001" style="width:100%"></div>
+  <div class="row">Lat scale: <span class="val" id="vSLat">1</span>
+    <input type="range" id="sSLat" min="0.3" max="3" step="0.001" style="width:100%"></div>
+  <div class="row">Lon scale: <span class="val" id="vSLon">1</span>
+    <input type="range" id="sSLon" min="0.3" max="3" step="0.001" style="width:100%"></div>
+  <button onclick="resetTile()">↺ Reset this tile</button>
+  <button onclick="exportJSON()">⬇ Download corrected JSON</button>
+  <div class="legend">
+    Dashed boxes = tile boundaries from registry.<br>
+    1. Pick a tile (each has its own color).<br>
+    2. Zoom to that tile's polygons.<br>
+    3. Adjust <b>shift first</b>, then <b>scale</b>, until outlines hug the roofs.<br>
+    4. Repeat for every tile.<br>
+    5. Download and replace <b>Backend/rooftop_results.json</b>.
+  </div>
+</div>
+<script>
+// ===== tile_registry.json (keys trimmed) =====
+const TILE_REGISTRY = {
+  "tile_17": {top_left:[21.164207,72.776518],            bottom_right:[21.161507,72.779418]},
+  "tile_18": {top_left:[21.164207,72.77941799999999],    bottom_right:[21.161507,72.782318]},
+  "tile_19": {top_left:[21.164207,72.78231799999999],    bottom_right:[21.161507,72.785218]},
+  "tile_21": {top_left:[21.164207,72.78811799999998],    bottom_right:[21.161507,72.791018]},
+  "tile_22": {top_left:[21.164207,72.79101799999998],    bottom_right:[21.161507,72.79391799999999]}
+};
+
+const COLORS = {tile_17:'#ff0000',tile_18:'#00aaff',tile_19:'#00ff66',
+                tile_21:'#ffaa00',tile_22:'#ff00ff',unknown:'#888888'};
+
+const API_BASE = 'http://127.0.0.1:8000';
+
+const map = L.map('map').setView([21.162964,72.785354],17);
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            {maxZoom:21,attribution:'© Esri'}).addTo(map);
+
+// draw tile boundary boxes
+Object.entries(TILE_REGISTRY).forEach(([tid,b])=>{
+  L.rectangle([[b.bottom_right[0],b.top_left[1]],[b.top_left[0],b.bottom_right[1]]],
+    {color:COLORS[tid],weight:1.5,dashArray:'6 4',fill:false,opacity:0.8}).addTo(map);
+});
+
+let rooftops=null, layerGroup=null, raf=false;
+const params={}, centroids={};
+const DEF={dLat:0,dLon:0,sLat:1,sLon:1};
+
+fetch(API_BASE+'/rooftops')
+  .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status+' from '+API_BASE+'/rooftops'); return r.json(); })
+  .then(data=>{
+    rooftops = Array.isArray(data)?data:(data.features||[]);
+    rooftops.forEach(it=>{
+      const st = (it.source_tile||'').trim();
+      it._tile = (st && TILE_REGISTRY[st]) ? st : (assignByBounds(it) || 'unknown');
+      if(!params[it._tile]) params[it._tile]={...DEF};
+    });
+    Object.keys(params).forEach(t=>{
+      let la=0,lo=0,n=0;
+      rooftops.forEach(it=>{ if(it._tile===t) it.geometry.coordinates[0].forEach(p=>{lo+=p[0];la+=p[1];n++;}); });
+      centroids[t]= n?[lo/n,la/n]:[72.785,21.163];
+    });
+    const sel=document.getElementById('tileSel');
+    Object.keys(params).sort().forEach(t=>{
+      const o=document.createElement('option');
+      o.value=t;
+      o.textContent=t+' ('+rooftops.filter(x=>x._tile===t).length+' roofs)';
+      sel.appendChild(o);
+    });
+    sel.addEventListener('change',loadSliders);
+    ['sDLat','sDLon','sSLat','sSLon'].forEach(id=>
+      document.getElementById(id).addEventListener('input',onSlide));
+    loadSliders();
+    const st=document.getElementById('status');
+    st.textContent='✅ '+rooftops.length+' rooftops loaded';
+    st.style.color='green';
+    redraw();
+  })
+  .catch(e=>{
+    const st=document.getElementById('status');
+    st.textContent='❌ '+e.message; st.style.color='red';
+    alert('Fetch failed: '+e.message+'\n\nMake sure uvicorn is running in the Backend terminal:\nuvicorn main:app --reload');
+  });
+
+function assignByBounds(it){
+  const ring=it.geometry.coordinates[0];
+  let lo=0,la=0; ring.forEach(p=>{lo+=p[0];la+=p[1];}); lo/=ring.length; la/=ring.length;
+  for(const [tid,b] of Object.entries(TILE_REGISTRY)){
+    if(la<=b.top_left[0]&&la>=b.bottom_right[0]&&lo>=b.top_left[1]&&lo<=b.bottom_right[1]) return tid;
+  }
+  return null;
+}
+const cur=()=>document.getElementById('tileSel').value;
+
+function loadSliders(){
+  const p=params[cur()]||DEF;
+  document.getElementById('sDLat').value=p.dLat;
+  document.getElementById('sDLon').value=p.dLon;
+  document.getElementById('sSLat').value=p.sLat;
+  document.getElementById('sSLon').value=p.sLon;
+  redraw();
+}
+function onSlide(){
+  const p=params[cur()];
+  p.dLat=+document.getElementById('sDLat').value;
+  p.dLon=+document.getElementById('sDLon').value;
+  p.sLat=+document.getElementById('sSLat').value;
+  p.sLon=+document.getElementById('sSLon').value;
+  if(!raf){ raf=true; requestAnimationFrame(()=>{raf=false; redraw();}); }
+}
+function resetTile(){ params[cur()]={...DEF}; loadSliders(); }
+
+function tf(p,t){
+  const pr=params[t]||DEF, c=centroids[t];
+  return [ c[1]+(p[1]-c[1])*pr.sLat+pr.dLat,   // lat
+           c[0]+(p[0]-c[0])*pr.sLon+pr.dLon ]; // lon
+}
+function redraw(){
+  document.getElementById('vDLat').textContent=(+document.getElementById('sDLat').value).toFixed(5);
+  document.getElementById('vDLon').textContent=(+document.getElementById('sDLon').value).toFixed(5);
+  document.getElementById('vSLat').textContent=(+document.getElementById('sSLat').value).toFixed(3);
+  document.getElementById('vSLon').textContent=(+document.getElementById('sSLon').value).toFixed(3);
+  if(!rooftops) return;
+  if(layerGroup) map.removeLayer(layerGroup);
+  layerGroup=L.layerGroup();
+  rooftops.forEach(it=>{
+    const rings=it.geometry.coordinates.map(ring=>ring.map(p=>tf(p,it._tile)));
+    layerGroup.addLayer(L.polygon(rings,{
+      color:COLORS[it._tile]||'#888', weight:1.5, opacity:.9,
+      fillColor:COLORS[it._tile]||'#888', fillOpacity:.15}));
+  });
+  layerGroup.addTo(map);
+}
+function exportJSON(){
+  const out=rooftops.map(it=>{
+    const o={ id:it.id, geometry:{ type:'Polygon',
+      coordinates: it.geometry.coordinates.map(ring=>ring.map(p=>{
+        const ll=tf(p,it._tile); return [ll[1],ll[0]];  // [lon,lat]
+      }))}};
+    if(it.area_m2!=null) o.area_m2=it.area_m2;
+    if(it.source_tile) o.source_tile=it.source_tile;
+    return o;
+  });
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([JSON.stringify(out)],{type:'application/json'}));
+  a.download='rooftop_results_corrected.json';
+  a.click();
+}
+</script>
+</body>
+</html>
