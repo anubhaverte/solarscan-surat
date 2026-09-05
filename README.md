@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # SolarScan Surat
 
 **Mapping unrealized rooftop solar potential in Surat, Gujarat, using computer vision and geospatial analysis grounded in real government energy data.**
